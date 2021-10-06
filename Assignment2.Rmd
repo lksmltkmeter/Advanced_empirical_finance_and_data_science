@@ -1,0 +1,989 @@
+---
+title: "Advanced Empirical Finance - Topics and Data Science - Assignment 2"
+output: pdf_document
+author: Lukas Malte Kemeter & Pablo S. Ascandoni
+### Acknowledge:  This code was written for an assignment of the course "Advanced Empirical Finance - Topics and Data Science" using the tools provided by the professor Stefan Voigt.
+header-includes: 
+- \usepackage{longtable}
+---
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE)
+knitr::opts_chunk$set(cache =  TRUE)
+```
+
+```{r packages, echo=FALSE, message=FALSE, warning = FALSE}
+
+# BEFORE YOU RUN THIS CODE:
+
+# 1. Restart your current R session and clear your environment . 
+# 2. Clear workspace environment
+rm(list = ls()) 
+
+library(stringr)
+library(tidyverse) 
+library(lubridate) 
+library(tidyquant)
+library(reshape)
+library(magick)
+library(knitr)
+options(kableExtra.latex.load_packages = FALSE)
+library(kableExtra)
+library(dplyr)
+library(tidyr)
+library(Matrix)
+library(glmnet)
+library(tidymodels)
+library(rpart)
+library(randomForest)
+library(keras)
+library(tfruns)
+library(ranger)
+library(egg)
+library(ggplot2)
+library(ggpubr)
+set.seed(42) #set seed 
+```
+
+Gu, Kelly and Xiu (2020) describe an asset's excess return as an additive prediction error model:
+
+$$
+r_{i,t+1}= E_t(r_{i,t+1})+\epsilon_{i,t+1} ~~~\text{where}~~~ E_t(r_{i,t+1})=g^*(z_{i,t})
+$$
+
+where $i=1,...,N$ is the stock index and $t=1,...,T$ is the period specific index. The objective is the predict excess returns one period ahead $r_{i,t+1}$ with the P-dimensional vector of predictors: $z_{i,t}$.
+
+
+# 1) Preparing and exploring the data:
+
+The provided sample, an extract of the CRISP sample used in Gu, Kelly and Xiu paper) contained 1.250.871 monthly observations of returns, an industry classifier sic2, 3 macroeconomic predictors (tbl,lty and mktcap) as well as 24 characteristics for 134772 unique stocks spanning from the February 1996 until December 2016. Note that there is not necessarily an observation for each pernmo at each point in time. We choose $z_{i,t}$ such that it contains the following financial variables: mvel1, retvol, chmom, maxret, dolvol, turn, mom12m, mom6m, baspread, ill. We also include as macroeconomic variables the treasury bill rate (tbl) and the long-term government bond yield (lty). We further generate interactions between the macroeconomic and the financial variables and include them in the analysis. Lastly, we generated dummies for each industry classifier contained in sic2 (a total of 72 dummy variables). We chose not to include them in the report to reduce computation time so that part of the code is commented out. All time-series regressors are already lagged one period with respect to the excess returns that we aim to predict (so we do not need to perform any further lagging).<br/>
+
+Figure 1 displays the macro variables over time. The long term yield displays higher short time variation but looks stationary around its downward sloping trend while the short term yield suffers wide movements and persistent movements over the cycle and remains persistently low after the 2007/9 crisis. This might be an issue for the performance of our models out of sample if we have trained them in periods of ample variation of the short term yield and then predict returns in the Zero lower Bound period.
+
+```{r data, echo=FALSE,  message=FALSE, warning = FALSE}
+
+# loading the data
+data <- readRDS("mandatory_assignment_2_clean_sample.rds")
+data <- data %>% select(1,2,3,(5:16),'sic2', 'tbl','lty') 
+
+# Create variable y and vector of regressors x:
+y = data$ret.adj 
+x = data %>% select(6:18)
+data_portfolio_sort <- data 
+
+# Create interactions between 10 fin. vars and the two macro vars:
+ for (i in seq(1:10)){
+  value_tbl = x[i] * x['tbl']
+  df_tbl = assign(paste0("int_tbl_",i), value_tbl)
+  names(df_tbl )[1] <- paste0("int_tbl_",i)
+  col_tbl = assign(paste0("int_tbl_",i), df_tbl)
+  x <- x %>% add_column(col_tbl)
+  value_lty = x[i] * x['lty']
+  df_lty = assign(paste0("int_lty_",i), value_lty)
+  names(df_lty )[1] <- paste0("int_lty_",i)
+  col_lty = assign(paste0("int_lty_",i), df_lty)
+  x <- x %>% add_column(col_lty)
+}
+
+# delete the unnecessary dfs created in workspace
+rm(list = ls(pattern = "int_"), i)
+rm(col_lty, col_tbl, df_lty, df_tbl, value_lty, value_tbl)
+
+# Transform sic2 into 72 dummies:
+#x <- x %>% mutate(value = 1)  %>% spread(sic2, value,  fill = 0 ) 
+
+```
+
+
+```{r plot_macro, echo=FALSE,  message=FALSE, warning = FALSE, fig.width=6,fig.height=1.8,fig.align="center", fig.cap="Macro Variables over time"}
+#plot tbl time series
+tbl_plot <- data %>%
+  ggplot(aes(x = date, y = tbl)) + 
+  geom_line() + 
+  theme_classic()+
+  labs(x = latex2exp::TeX("Date"), y = latex2exp::TeX("Short term US Treasury yield")) +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 6),
+        title = element_text(size = 10),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7))
+
+# plot lty time series
+lty_plot <- data %>% # Plot the time series of macro vars
+  ggplot(aes(x = date, y = lty)) + 
+  geom_line() +
+  theme_classic()+
+  labs(x = latex2exp::TeX("Date"), y = latex2exp::TeX("Long term yield")) +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 8),
+        axis.text = element_text(size = 6),
+        title = element_text(size = 10),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7))
+
+ggarrange(tbl_plot, lty_plot, ncol=2, nrow=1)
+rm(tbl_plot, lty_plot)
+```
+
+Figure 2 then shows the number of firms per industry and over time. We can see that industries are not equally represented and very few account for the majority of firms in the sample. Although the total number of firms decay over time, this does not drastically change the weight of each industry although there are variations. This visualization was inspired by an anonymous peer reviewed paper.
+
+```{r industry_stats, echo=FALSE,  message=FALSE, warning = FALSE, include=TRUE, fig.width=8, fig.height=2, fig.align="center", fig.cap="Number of firms by industry and over time"}
+#compute unique number of permnos per month
+fig1 <- number_of_firms <- aggregate(permno ~ date, data, function(x) length(unique(x)))  %>% 
+  ggplot(aes(x=date,y= permno))+
+  geom_line()+
+  ggtitle(latex2exp::TeX("# firms over time")) + 
+  labs(x = "Time", y = "Count")+
+  expand_limits(y = 0) +
+  theme_classic() +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 7),
+        plot.title = element_text(size = 10),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7))
+
+# Histogram of distribution of industries in the testing set
+fig2 <- pernmo_first_half <- data %>% filter(date <= '2005-12-31') %>% 
+  ggplot(aes(x=sic2)) +
+  geom_histogram(bins=89) +
+  ggtitle(latex2exp::TeX("Firms per industry in 1996:2005")) + 
+  labs(x = "Industry classification", y = "Count")+
+  theme_classic() +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 7),
+        plot.title = element_text(size = 10),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7))
+
+# Histogram of distribution of industries in the training set
+fig3 <- pernmo_second_half <- data %>%  filter (date > '2005-12-31') %>% #Training sample period
+  ggplot(aes(x=sic2)) +
+  geom_histogram(bins=89) +
+  labs(x = "Industry classification", y = "Count", title = latex2exp::TeX("Firms per industry in 2006:2016"))+
+  theme_classic() +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 7),
+        plot.title = element_text(size = 10),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7))
+
+ggarrange(fig1, fig2, fig3, ncol=3, nrow=1)
+rm(fig1, fig2, fig3)
+
+```
+
+
+# 2) Question 2: Arbitrage Pricing Theory (Ross, 1976)
+
+Arbitrage Pricing Theory (Ross, 1976) assume that in a competitive and frictionless market, the return of an asset $i$ follows the stochastic process:
+$$R_i = a_i + b_i'f+\epsilon_i$$
+where $b_i$ is the $(P\times 1)$ vector of loadings, $f$ is the $(P\times 1)$ vector of time-varying factors, $a_i$ is the combination of static factors and $\epsilon_i$ is the market noise where $E(\epsilon_i)=0$. 
+
+Let now the risk free rate $R_{rf}$ from the static factors and define $g^*(.)$ as a rigid linear function of factors $z_i=f$ such that: $g(.)=a_i-\log R_{rf} + b_i'f$. The APT can be mapped into the general framework to predict excess returns: $r_i := \log R_i - \log R_{rf}$. Adding time subscripts, we can predict 1-period-ahead excess returns with:
+$$r_{i,t+1}= E_t(r_{i,t+1})+\epsilon_{i,t+1}= g(^*z_{i,t})+\epsilon_{i,t+1}$$
+Instead of using a linear function, in this assignment we consider a flexible function of P predictors $(z)$ given by $g^*(.)$. This function imposes some rigidities. First, it is independent of i and t, meaning that it retains the same form over time and we can estimate the one period ahead expected return. Furthermore, it only uses information from the stock i at period t but not from any other stocks nor previous periods. These are some shortcomings of the model against models that allow using information from the whole cross-section of returns or longer time horizons.
+
+
+# 3) Question 3: Hyperparameter tunning and data splitting:
+
+Hyperparameter selection is done to penalize overfitting. Consider the following linear objective function to minimize the distance between prediction as given by the Mean Squared Error (MSE) and the data by choosing a set of coefficients estimates $\theta$:
+$$L(\theta) = \frac{1}{NT}\sum_{i=1}^N\sum_{t=1}^T (r_{i,t+1}-g(z_{i,t};\theta))^2$$
+When the number of predictors approach the number of observations it is unwise to train your model with the entire data set by minimizing this criterion function, as OLS becomes inconsistent. If you do it, the model will overfit the training data set but will perform badly in out of sample predictions, as the model will capture most of the noise that should have been disregarded from the model. Instead, if you want to predict out of sample, it is better to penalize this overfitting with a hyperparameter, e.g. $(\lambda)$ in this case, and validate your model several times for a range of values of the hyperparameter, choosing the value that minimizes the MPE in the validation sample, and modifying the criterion function as follows:
+$$L(\theta) = \frac{1}{NT}\sum_{i=1}^N\sum_{t=1}^T (r_{i,t+1}-g(z_{i,t};\theta))^2 + \phi(\theta;\lambda;...)$$
+Tuning $(\lambda)$ to minimize this new objective function might reduce variance, but introduces a bias in predictions. Unlike OLS, now our estimates are biased by design as we are not minimizing the distance between prediction and testing data points. There is a trade-off between bias and variance in prediction. 
+
+We split the data into three sets, keeping the period from 01-01-2012 to 31-12-2016 for out-of-sample testing. Given the large dataset, we use 80% ($\leq$ 31-12-2011) as training data and the last 20% to cross-validate the model. The split by-date uses the function *split()* while *rsample:initial_time_split()* is used to split time series by percentage of observations. The aim is to use the training data set to fit the models and then make predictions with the validation data for different hyperparameter values and select the hyperparameter that minimized the MSE. The performance of the model is then tested out-of-sample and that prediction is used to compare across models.
+
+Hyperparameter tuning also has shortcomings. Here the training and validation sets are always the same such that they are part of the tuning and therefore not really out-of-sample (Gu, Kelly and Xiu, 2020). Using K-fold cross validation would partially solve this problem by randomly splitting the observations in K non-overlapping sets such that training and validation data changes in each iteration. Another potential alternative to tuning parameters dynamically from a validation set could be to select the hyperparameters (e.g. from a grid search) that result in the most favorable information criteria (e.g. the BIC)\footnote{Xiao, H., and Sun, Y. (2019). On tuning parameter selection in model selection and model averaging: A monte carlo study}.
+
+```{r data_split, echo=FALSE,  message=FALSE,warning = FALSE}
+
+################################################################################
+#                             3.3) DATA SPLITTING
+################################################################################
+
+# create new df for splitting combining x, y and date
+total_data <- cbind(data$date, y, x) %>% 
+  dplyr::rename(date = 'data$date') %>%
+  arrange(date)
+
+# Split your data by date: 2012-01-01
+initial_data <- split(total_data, total_data$date < as.Date("2012-01-01"))
+# Testing data: after 2012-01-01
+test_data <- initial_data[[1]] 
+testing_y <- test_data %>% dplyr::pull(y)
+testing_x <- test_data %>% dplyr::select(-date, -y) %>% 
+  as.matrix() %>% Matrix(sparse = TRUE)
+
+# Training and validation data: before or equal to 2012-01-01
+train_val_data <- initial_data[[2]]
+
+# Split into training (80%) and validation (20%) data for hyperparameter tuning task:
+train_val_data <- rsample::initial_time_split(train_val_data, prop = 0.8) 
+# Select training data
+training_y <- training(train_val_data) %>% pull(y)
+training_x <- training(train_val_data) %>% dplyr::select(-date, -y) %>% 
+  as.matrix() %>% Matrix(sparse = TRUE) 
+# Select cross-validation data
+validation_y <- testing(train_val_data) %>% pull(y)
+validation_x <- testing(train_val_data) %>% dplyr::select(-date, -y) %>% 
+  as.matrix() %>% Matrix(sparse = TRUE)
+
+
+#### CLEAR UP SOME VARIABIABLES:
+#rm(i,df_lty, df_tbl, value_lty, value_tbl, col_lty, col_tbl)
+rm(initial_data, data, data.sum, firm.sum)
+
+
+################################################################################
+#          SET UP 2 EMPTY DFs TO COLLECT HYPERPAREMETERS AND RESULTS
+################################################################################
+
+#initialize empty data frames for collection
+MPE_df <- data.frame(matrix(ncol=2,nrow=0))
+c<-c("Model","MSE value")
+colnames(MPE_df) <- c
+
+hyper_df <- data.frame(matrix(ncol=4,nrow=0))
+c <- c("Type","RIDGE","FOREST","NN")
+colnames(hyper_df) <- c
+
+```
+
+# 4) Question 4: Machine learning models:
+
+We implement 3 machine learning models: Ridge, Random Forest and Neural Network and compare the performance in terms of the Mean Squared Error (MSE) \textit{(also denoted as Mean Prediction Error (MPE))} in Table 1. We also collect the hyperparameters which will be reported in Table 2. Simultaneously, we implement portfolio sorts for each model fit (see section 5).
+
+## 4.1) Ridge:
+
+The Ridge objective criterion is obtained by setting $\alpha=0$ in the elastic net criterion:
+$$L^{EN}(\theta) = \frac{1}{NT}\sum_{i=1}^N\sum_{t=1}^T (r_{i,t+1}-g(z_{i,t};\theta))^2 + \alpha\lambda\sum_{j=1}^P|\theta_j| + (1-\alpha)\frac{1}{2}\lambda\sum_{j=1}^P\theta_j^2$$ 
+$$L^{Ridge}(\theta) = \frac{1}{NT}\sum_{i=1}^N\sum_{t=1}^T (r_{i,t+1}-g(z_{i,t};\theta))^2 + \frac{1}{2}\lambda\sum_{j=1}^P\theta_j^2$$
+We use $glmnet$ to fit a Ridge with penalization given by the hyperparameter $(\lambda)$. The fitting is done to minimize the criterion above where complexity is penalized with a $L2$ norm (sum of squared elements in the $\theta$ vector). Using the hyperparameter tuning procedure described in section 3, we chose $\lambda$ to minimize MSE in the cross-validation sample and fit the final model to predict $\widehat{r}_{i,t+1}$ using the testing data. 
+
+Figure 3 shows the results of the ridge. On the left plot, the MSE for the training and validation data sets for different values of $\lambda$. The training error is lower because the model performs better in-sample with $\theta$ chosen to minimize it. The larger $\lambda$, the more we penalize overfitting (complexity) and therefore increase training error. The chosen value of $\lambda$ that minimizes validation error yields an out-of-sample prediction error in the testing set (provided in Table 1) below the training and validation error. We would expect the testing error to be the highest unless the testing data represented a period of uncharacteristically low volatility in which the model made better out-of-sample predictions. We cannot discard that the structural differences between testing and training data could explain this results. The right hand side plot displays the coefficient estimates for each variable for different values of $\lambda$ where the chosen $\lambda$ is shown as the vertical line. The high penalization induces a shrinkage of $\theta_i$ towards zero. A Lasso regression would have forced the least significant coefficients to 0, selecting the most relevant factors and disregarding the least important one.
+
+
+```{r ridgefit, echo=FALSE,  message=FALSE,warning = FALSE}
+
+# Fit ridge for whole data set:
+fit_ridge <- glmnet(x %>% as.matrix() %>% Matrix(sparse = TRUE), 
+                    y, alpha = 0)
+
+## HYPERPARAMETER TUNING:
+# Use the training set to estimate parameters for a grid of lambdas and then... 
+# ...evaluate the goodness of fit by predicting rp_div with the estimated coefficients...
+# ...for the validation set. Choose the lambda that minimizes the MSE.
+
+lambdas <- fit_ridge$lambda
+lambdas <- lambdas[lambdas > min(lambdas[lambdas!=min(lambdas)] )]  
+
+# map_df(vector, function(...)) applies a function(lambda) to a vector of lambdas:
+accuracy <- purrr::map_df(lambdas, function(lambda){
+  ## Training :
+  # Obtain parameter estimates with training sample. -> Ridge: glmnet(x,y,alpha=0) 
+  train_fit <- glmnet(training_x, 
+                      training_y,
+                      lambda = lambda, 
+                      alpha = 0) 
+  # Get MSE with train sample. MSE = mean(y-y_hat)^2
+  train_MPE <- mean((training_y - predict(train_fit, training_x))^2)
+  ## Cross-Validation:
+  # Get MSE with cross-validation sample
+  val_MPE <- mean((validation_y - predict(train_fit, validation_x))^2)
+  ## Organizing data:
+  tibble(lambda, train_MPE, val_MPE)
+})
+
+```
+
+```{r ridgeplots, echo=FALSE,  message=FALSE,warning = FALSE, fig.width=8, fig.height=3,fig.align="center"}
+
+
+## Plot MPE for lambdas:
+p1 <- accuracy %>% 
+  pivot_longer(-lambda, names_to = "Model") %>%  # names but lambda, to 'Model'
+  filter(lambda > min(lambda)) %>%
+  ggplot(aes (x = lambda, y  = value, color = Model)) + 
+  geom_point() +
+  theme_classic() +
+  ggtitle(latex2exp::TeX("Relationship between Mean Squared Error and $\\lambda$"))+
+  scale_x_log10() +
+  labs(x = latex2exp::TeX("Penalization ($\\lambda$)"), 
+       y = latex2exp::TeX("Mean Squared Error")) +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 7),
+        plot.title = element_text(size = 10),
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 7)) 
+
+
+# lambda that minimized MSE in the validation sample:
+lambda_ridge <- accuracy %>% filter(val_MPE == min(val_MPE)) %>% pull(lambda)
+
+# Ridge estimation after choosing the hyperparameter lambda:
+final_ridge <- glmnet(training_x, 
+                    training_y, 
+                    lambda = lambda_ridge, 
+                    alpha = 0)
+
+# Obtain MSPE:
+y_hat_ridge <- predict(final_ridge, testing_x)
+MPE_ridge <- mean((testing_y - y_hat_ridge)^2)
+
+p1 <- p1 + geom_vline(xintercept = lambda_ridge) #+ geom_hline(yintercept = MPE_ridge)
+
+#Update values in collection df
+lambda_first <- accuracy %>% filter(lambda == max(lambda)) %>% pull(lambda)
+lambda_last <- accuracy %>% filter(lambda == min(lambda)) %>% pull(lambda)
+hyper_df[1, ] <-c("Lambda min",round(lambda_last,2),NA,NA)
+hyper_df[2, ] <-c("Lambda max",round(lambda_first,2),NA,NA)
+hyper_df[3, ] <-c("Lambda choice",round(lambda_ridge,2),NA,NA)
+MPE_df[1, ] <-c("Ridge",round(MPE_ridge,2))
+
+#Print current MSPE comparison table
+#kable(MPE_df, caption = "Current MPE comparison table", digits = 2)  
+
+# Clear up some variables:
+rm(accuracy, lambdas)
+```
+
+```{r ridge2,  echo=FALSE,  message=FALSE,warning = FALSE,fig.width=8, fig.height=3.5, fig.align="center", fig.cap= "Ridge regression" }
+
+## Visualize coefficient estimates for lambda values:
+p2 <- broom::tidy(fit_ridge) %>%
+  filter(term != "(Intercept)") %>%
+  ggplot(aes(x=lambda, y = estimate, color = term)) +
+  geom_line() +
+  ggtitle(latex2exp::TeX("Ridge coefficient estimates for lambda values"))+
+  geom_hline(data = . %>% filter(lambda == min(lambda)), 
+             aes(yintercept = estimate, color = term), 
+             linetype = "dotted") + 
+  geom_vline(xintercept = lambda_ridge) +
+  theme_classic() +
+  scale_x_log10() +
+  labs(x = latex2exp::TeX("Penalization ($\\lambda$)"), y = latex2exp::TeX("Coefficient estimate")) +
+  theme(legend.position = "bottom",
+        axis.title = element_text(size = 9),
+        axis.text = element_text(size = 7),
+        plot.title = element_text(size = 10),
+        legend.key.height = unit(0.3, "cm"),
+        legend.title = element_blank(),
+        legend.text = element_text(size = 7)) 
+
+
+plot <- ggarrange(p1, p2, ncol=2, nrow=1, legend = "bottom")
+annotate_figure(plot)
+
+```
+
+
+```{r question5Ridge, echo=FALSE,  message=FALSE,warning = FALSE}
+#this code targets the first 2 bullet points of question 5. It creates portfolio sorts on y_hat of the current model (in this case the RIDGE). A portfolio is then created that buys the 10th quantile and sells the 1 quantile. The resulting average return is collected in a dataframe. For each model that will follow, this process will be repeated and the resulting average return will be appended to the collection data frame.
+
+################################################################################
+#                         portfolio sort:
+################################################################################
+
+# Split your data by date: 2012-01-01
+initial_data2 <- split(data_portfolio_sort, data_portfolio_sort$date < as.Date("2012-01-01"))
+# Testing data: after 2012-01-01
+test_data_portfolio_sort <- initial_data2[[1]] %>% cbind(y_hat_ridge) %>% dplyr::rename(y_hat_ridge = "s0")
+
+# calculate quantiles
+percentiles <- seq(0.1, 0.9, 0.1)
+percentiles_names <- map_chr(percentiles, ~paste0("q", .x*100))
+percentiles_funs <- map(percentiles,
+                        ~partial(quantile, probs = .x, na.rm = TRUE)) %>%
+  set_names(nm = percentiles_names)
+
+quantiles <- test_data_portfolio_sort %>%
+  na.omit() %>%
+  group_by(permno) %>%
+  arrange(permno, date) %>%
+  group_by(date) %>%
+  summarise_at(vars(y_hat_ridge), lst(!!!percentiles_funs))
+
+#store plot of quantiles
+ quant_ridge <- quantiles %>%
+   pivot_longer(-date, names_to = "Quantile") %>%
+   ggplot(aes(x = date, y = value, color = Quantile)) + geom_line() +
+   theme_classic() + 
+   labs(x = "", y = "")+
+    theme(axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        title = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7))+
+   ggtitle(latex2exp::TeX("Ridge"))
+ 
+ 
+# sort all stocks into decile portfolios
+portfolios <- test_data_portfolio_sort %>%
+  left_join(quantiles, by = "date") %>%
+  mutate(portfolio = case_when(y_hat_ridge <= q10 ~ 1L,
+                               y_hat_ridge > q10 & y_hat_ridge <= q20 ~ 2L,
+                               y_hat_ridge > q20 & y_hat_ridge <= q30 ~ 3L,
+                               y_hat_ridge > q30 & y_hat_ridge <= q40 ~ 4L,
+                               y_hat_ridge > q40 & y_hat_ridge <= q50 ~ 5L,
+                               y_hat_ridge > q50 & y_hat_ridge <= q60 ~ 6L,
+                               y_hat_ridge > q60 & y_hat_ridge <= q70 ~ 7L,
+                               y_hat_ridge > q70 & y_hat_ridge <= q80 ~ 8L,
+                               y_hat_ridge > q80 & y_hat_ridge <= q90 ~ 9L,
+                               y_hat_ridge > q90 ~ 10L))
+
+#calculate the market cap weighted average returns for each portfolio for each month
+portfolios_ts <- portfolios %>%
+  mutate(portfolio = as.character(portfolio)) %>%
+  group_by(portfolio, date) %>%
+  summarize(ret_vw = weighted.mean(y_hat_ridge, mktcap, na.rm = TRUE))%>%
+  #ret_equal_weights = mean(y_hat_ridge, na.rm = TRUE)) %>%                  # mkt_excess = mkt -rf used for CAPM
+  na.omit() %>%
+  ungroup()
+
+# Create buy 10 sell 1 portfolio
+portfolios_ts_101 <- portfolios_ts %>%
+  filter(portfolio %in% c("1", "10")) %>%
+  pivot_wider(names_from = portfolio,
+              values_from = ret_vw) %>%
+  mutate(ret_vw = `10` - `1`,
+         portfolio = "10-1") %>%
+  select(portfolio, date, ret_vw)
+
+# combine everything
+portfolio_returns <- bind_rows(portfolios_ts_101) %>%
+  mutate(portfolio = factor(portfolio, levels = c(as.character(seq(1, 10, 1)), "10-1")))
+
+#calculate the average return for RIDGE buy 10 sell 1 portfolio
+average_ret <- portfolio_returns %>%
+  group_by(portfolio) %>%
+  arrange(date) %>%
+  do(model = lm(paste0("ret_vw ~ 1"), data = .)) %>%
+  mutate(nw_stderror = sqrt(diag(sandwich::NeweyWest(model, lag = 6)))) %>%
+  mutate(broom::tidy(model)) %>%
+  ungroup() %>%
+  mutate(nw_tstat = estimate / nw_stderror) %>%
+  select(estimate, nw_tstat) %>%
+  t() 
+
+average_ret <- data.frame(average_ret) %>% 
+  dplyr::rename("Ridge"="average_ret")
+
+#initialize a df that collects the prediction for every model
+collect_portolio101 <- average_ret
+```
+
+
+## 4.2) Random Forest:
+
+Random forests is a method that combines several random trees by drawing $ntree$ bootstrap samples from the data and fitting a tree to each sample to then average their forecasts, effectively reducing individual tree's overfitting and stabilizing their out-of-sample performance. Each of the random trees is a non-parametric model that makes smart splits of data for the predictor space into several partitions $\{R_1,...,R_J\}$. For a variable $x$ in a specific sector $R_j$, the unknown function $g^*(.)$ averages all $r_i$ training data points for which $x$ is in the current partition. To perform a split, select a variable $j$ and a threshold $s$ and create two new partitions. One region would contain values where variable $j$ is smaller than $s$, the other region contains all larger or equal to $s$. Variable $j$ and the threshold $s$ are selected to minimize the residual sum of squares:
+$$RSS = \sum_{i:x_i \in R_1(j,s)} (r_{i,t+1} -\widehat{r}_{i,t+1}^{R_1})^2 + \sum_{i:x_i \in R_2(j,s)} (r_{i,t+1} -\widehat{r}_{i,t+1}^{R_2})^2 $$
+Each time a bootstrap sample is selected for a tree (Bagging), the rest of the data serves an out-of-bag (OOB) sample (like a quasi validation data set). By fixing the number of trees $ntree=25$, the hyperparamters tuned are the number of random predictors as potential candidates for each split ($mtry$) and the minimum number of terminal nodes ($nodesize$). We use the package *ranger* and follow the procedure in: https://uc-r.github.io/random_forests. We then perform a grid search and loop over each combination of $mtry$ and $nodesize$ to calculate the out-of-bag error. We then train a tree with the hyperparameter combination that resulted in the best overall prediction. 
+```{r rf ,echo=FALSE,  message=FALSE, warning = FALSE,  include = FALSE}
+################################################################################
+#                           3.3.4) RANDOM FOREST:
+################################################################################
+# hyperparameter grid search
+hyper_grid <- expand.grid(
+  mtry       = seq(5, 7, by = 2),
+  node_size  = seq(5, 7, by = 2),
+  OOB_MSE   = 0
+)
+
+#specify max number of trees to be grown
+num_trees <- 25
+
+# total number of combinations
+nrow(hyper_grid)
+
+#grid search calculates the out-of-bag error for each combination of hyperparams in the grid
+for(i in 1:nrow(hyper_grid)) {
+  
+  # train model
+  model <- ranger(
+    formula         = y ~ ., 
+    data            = training(train_val_data) %>% select(-date), 
+    num.trees       = num_trees,
+    mtry            = hyper_grid$mtry[i],
+    min.node.size   = hyper_grid$node_size[i],
+    #sample.fraction = hyper_grid$sampe_size[i],
+    seed            = 2021
+  )
+
+  # add OOB error to grid
+  hyper_grid$OOB_MSE[i] <- model$prediction.error
+}
+
+```
+
+
+```{r forest_plots,  echo=FALSE,  message=FALSE,warning = FALSE,fig.width=5, fig.height=1.7, fig.align="center", fig.cap="Relationship between number of trees in forest and MPE"}
+
+#select the hyperparams that produced the model with the lowest out-of-bag error
+grid_choice  <- hyper_grid %>% filter(OOB_MSE == min(OOB_MSE))
+
+#fit a forest with the best hyperparameter combination
+set.seed(2021)
+fit_forest <- randomForest(
+  formula = y ~.,
+  data = training(train_val_data) %>% select(-date),
+  xtest = testing(train_val_data) %>% select(-date, -y),
+  ytest = testing(train_val_data) %>% pull(y),
+  ntree = num_trees,
+  keep.forest=TRUE,
+  maxnodes = grid_choice$node_size,
+  mtry = grid_choice$mtry)
+
+# extract OOB & validation errors
+oob <- fit_forest$mse
+validation <- fit_forest$test$mse
+
+# compare error rates for various sizes of ntrees
+p3 <- tibble::tibble(
+  `Out of Bag Error` = oob,
+  `Validation error` = validation,
+  ntrees = 1:fit_forest$ntree
+) %>%
+  gather(Metric, MSE, -ntrees) %>%
+  ggplot(aes(ntrees, MSE, color = Metric)) +
+  geom_line() +
+  theme_classic() +
+  theme(axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        title = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7))+
+  xlab(latex2exp::TeX("Number of trees")) +
+  ylab(latex2exp::TeX("Mean Squared Error"))
+
+# prediction for forest with best fit
+y_hat_random_forest <- predict(fit_forest, test_data)
+MPE_forest <- mean((y_hat_random_forest - test_data$y)^2)
+
+# Print errors graph:
+p3 + geom_vline(xintercept = fit_forest$ntree) #+ geom_hline(yintercept = MPE_forest)
+
+#Update values in collection df
+c = hyper_grid %>% filter(mtry == min(mtry),node_size==max(node_size))
+cc = hyper_grid %>% filter(mtry == min(mtry),node_size==min(node_size))
+ccc = hyper_grid %>% filter(mtry == max(mtry),node_size==max(node_size))
+mtry_min <- c[1]
+mtry_max <- ccc[1]
+node_size_min <- cc[2]
+node_size_max<- c[2]
+
+hyper_df[4, ] <-c("Numer of trees",NA,round(num_trees,2),NA)
+hyper_df[5, ] <-c("mtry min",NA,round(mtry_min,2),NA)
+hyper_df[6, ] <-c("mtry max",NA,round(mtry_max,2),NA)
+hyper_df[7, ] <-c("mtry choice",NA,round(grid_choice$mtry,2),NA)
+hyper_df[8, ] <-c("nodes min",NA,round(node_size_min,2),NA)
+hyper_df[9, ] <-c("nodes max",NA,round(node_size_max,2),NA)
+hyper_df[10, ] <-c("nodes choice",NA,round(grid_choice$node_size,2),NA)
+
+MPE_df[2, ] <-c("Random Forest",round(MPE_forest,2))
+
+#Print current MSPE comparison table
+#kable(MPE_df, caption = "Current MPE comparison table", digits = 3)  
+```
+
+```{r question5Forest, echo=FALSE,  message=FALSE,warning = FALSE}
+#this code targets the first 2 bullet points of question 5. It creates portfolio sorts on y_hat of the current model (in this case the Tree). A portfolio is then created that buys the 10th quantile and sells the 1 quantile. The resulting average return is collected in a dataframe. For each model that will follow, this process will be repeated and the resulting average return will be appended to the collection data frame.
+
+################################################################################
+#                         portfolio sort:
+################################################################################
+#remove previously defined unnecessary vars
+rm(quantiles,portfolios,portfolios_ts,portfolios_ts_101,portfolio_returns,average_ret)
+
+# Split your data by date: 2012-01-01
+initial_data2 <- split(data_portfolio_sort, data_portfolio_sort$date < as.Date("2012-01-01"))
+# Testing data: after 2012-01-01
+test_data_portfolio_sort <- initial_data2[[1]] %>% cbind(y_hat_random_forest) %>% dplyr::rename(y_hat_random_forest = "y_hat_random_forest")
+
+quantiles <- test_data_portfolio_sort %>%
+  na.omit() %>%
+  group_by(permno) %>%
+  arrange(permno, date) %>%
+  group_by(date) %>%
+  summarise_at(vars(y_hat_random_forest), lst(!!!percentiles_funs))
+
+#store plot of quantiles 
+ quant_forest <- quantiles %>%
+   pivot_longer(-date, names_to = "Quantile") %>%
+   ggplot(aes(x = date, y = value, color = Quantile)) + geom_line() +
+   labs(x = "", y = "")+
+   theme_classic()+
+      theme(axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        title = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7))+
+   ggtitle(latex2exp::TeX("Random Forest"))
+ 
+# sort all stocks into decile portfolios
+portfolios <- test_data_portfolio_sort %>%
+  left_join(quantiles, by = "date") %>%
+  mutate(portfolio = case_when(y_hat_random_forest <= q10 ~ 1L,
+                               y_hat_random_forest > q10 & y_hat_random_forest <= q20 ~ 2L,
+                               y_hat_random_forest > q20 & y_hat_random_forest <= q30 ~ 3L,
+                               y_hat_random_forest > q30 & y_hat_random_forest <= q40 ~ 4L,
+                               y_hat_random_forest > q40 & y_hat_random_forest <= q50 ~ 5L,
+                               y_hat_random_forest > q50 & y_hat_random_forest <= q60 ~ 6L,
+                               y_hat_random_forest > q60 & y_hat_random_forest <= q70 ~ 7L,
+                               y_hat_random_forest > q70 & y_hat_random_forest <= q80 ~ 8L,
+                               y_hat_random_forest > q80 & y_hat_random_forest <= q90 ~ 9L,
+                               y_hat_random_forest > q90 ~ 10L))
+
+#calculate the market cap weighted average retruns for each portfolio for each month
+portfolios_ts <- portfolios %>%
+  mutate(portfolio = as.character(portfolio)) %>%
+  group_by(portfolio, date) %>%
+  summarize(ret_vw = weighted.mean(y_hat_random_forest, mktcap, na.rm = TRUE))%>%
+  #ret_equal_weights = mean(y_hat_ridge, na.rm = TRUE)) %>%                  # mkt_excess = mkt -rf used for CAPM
+  na.omit() %>%
+  ungroup()
+
+# Create buy 10 sell 1 portfolio
+portfolios_ts_101 <- portfolios_ts %>%
+  filter(portfolio %in% c("1", "10")) %>%
+  pivot_wider(names_from = portfolio,
+              values_from = ret_vw) %>%
+  mutate(ret_vw = `10` - `1`,
+         portfolio = "10-1") %>%
+  select(portfolio, date, ret_vw)
+
+# combine everything
+portfolio_returns <- bind_rows(portfolios_ts_101) %>%
+  mutate(portfolio = factor(portfolio, levels = c(as.character(seq(1, 10, 1)), "10-1")))
+
+#calculate the average return for Forest buy 10 sell 1 portfolio
+average_ret <- portfolio_returns %>%
+  group_by(portfolio) %>%
+  arrange(date) %>%
+  do(model = lm(paste0("ret_vw ~ 1"), data = .)) %>%
+  mutate(nw_stderror = sqrt(diag(sandwich::NeweyWest(model, lag = 6)))) %>%
+  mutate(broom::tidy(model)) %>%
+  ungroup() %>%
+  mutate(nw_tstat = estimate / nw_stderror) %>%
+  select(estimate, nw_tstat) %>%
+  t() 
+
+average_ret <- data.frame(average_ret) %>% 
+  dplyr::rename("Random Forest"="average_ret")
+
+#collect the prediction for current model
+collect_portolio101 <- cbind(collect_portolio101,average_ret)
+```
+Figure 4 displays the OOB and validation errors for each number of trees in the forest. The prediction error seems to be relatively insensitive to increasing the number of trees. The final fit has $mtry = 7$ and 
+$nodesize = 7$, displaying again a higher accuracy out-of-sample (Table 1) than in-sample.
+
+## 4.3) Neural Network:
+
+As a third machine learning model we implement a feed forward Neural Network (NN) with the following structure: An input layer (the vector of predictors $z$), 2 dense layers that interact the predictors $z_i$ non-linearly and an output layer that aggregates dense layers into a prediction. Each layer has a certain number of nodes and each node is connected with all nodes from prior and following layers. Each neuron applies a non-linear activation function to its aggregated signal before sending the output to the next layer and optimize the weights $\theta$. Finally the results from each neuron are linearly aggregated in an output forecast. The model is trained with an algorithm (backpropagation) that derives the gradient of the error with respect to the weights. The aim is again minimize $MSE = \frac{1}{NT}\sum_{i=1}^N\sum_{t=1}^T (r_{i,t+1}-g(z_{i,t};\theta))^2$ where the output forecast is linear.
+
+We focus on tuning 4 parameters: The dropout rate (share of observations dropped after layer 1 to prevent overfitting), the number of neurons in layer 1 and layer 2 and an L2 regularization on weights after the 2nd layer. Regularizing is another tool to reduce overfitting as it shrinks the weights towards zero when they provide no big gradient improvements. As a set-up, we specify a dictionary containing 2 potential values for each parameter, thus giving us 16 combinations to run. We also define a function that fits a NN with a few fixed parameters such as 10 epochs, a learning rate of 0.01 (which controls the step size of the gradient descent), the non-linear  activation function: $ReLU(x)=\max\{0,x\}$, and an early stopping criterion (stop after 5 epochs without improvement). The fit function and an initial input dictionary are dumped by saving to a new R file in the current directory. We then use a function called $tuning\_run(dumped.R, sample = 0.25, flags = par)$ which runs the NN in the file dumped.R one time for each combination of hyperparameters. As running 16 NNs would be out of scope, we restrict it to 25% random combinations, so 4 total runs. We set $seed=42$ and in our testing this secured that the same 4 combinations were selected when running the file multiple times (but we can't fully guarantee perfectly reproducible results as it could have been a coincidence). The best model is selected by ordering all runs and storing the attributes of the one with the lowest MSE. We end up with a best model with a dropout rate of 0.3, 64 neurons in the first layer, 16 in the second and a l2 penalty of 0.001. The MPE of our best NN is slightly lower than for the previous two at 12.13 and thus the best overall model.
+```{r NN, echo=FALSE,  message=FALSE,  include = FALSE}
+################################################################################
+#                           3.3.5) NEURAL NETWORK:
+################################################################################
+
+##########################    Create a dump file in your directory that contains the NN model  #####################################
+FLAGS <- flags(
+  flag_numeric('dropout1', 0.3),
+  flag_integer('neurons1', 64),
+  flag_integer('neurons2', 16),
+  flag_numeric('l2', 0.001))
+
+run_NN <- function(FLAGS){
+  
+  #set epchs and patience
+  epochs = 10
+  early_stop <- callback_early_stopping(monitor = "val_loss", patience = 5)
+  
+  model <- keras_model_sequential() %>% 
+    layer_flatten(input_shape = dim(training(train_val_data) %>% select(-date, -y) %>% as.matrix())[2]) %>% 
+    layer_dense(units = FLAGS$neurons1, 
+                activation = "relu") %>%
+    layer_dropout(FLAGS$dropout1) %>%
+    layer_dense(units = FLAGS$neurons2, 
+                activation = "relu",
+                kernel_regularizer = regularizer_l2(l = FLAGS$l2)) %>%
+    layer_dense(1) %>%  #compile into machine reading code
+    compile(
+      loss = "mse",
+      optimizer = optimizer_rmsprop(lr=0.01),
+      metrics = "mean_squared_error")
+  
+  #fit model and store train results
+  hist <- model %>% 
+    fit(
+      x = training(train_val_data) %>% select(-date, -y) %>% as.matrix(), 
+      y = training(train_val_data) %>% pull(y),
+      validation_data = list(testing(train_val_data) %>% select(-date, -y)%>% as.matrix(), 
+                             testing(train_val_data) %>% pull(y)),
+      epochs = epochs,
+      verbose = 1, #show progress bar in console
+      callbacks = list(early_stop))
+  
+  plot(hist)
+  
+  
+  score <- model %>% evaluate(
+    test_data %>% select(-date, -y) %>% as.matrix(),
+    test_data %>% pull(y) %>% as.matrix(),
+    verbose = 0
+  )
+  
+  save_model_hdf5(model, 'model.h5')
+  
+}
+
+# dump the objects FLAGS and the function run_NN in dump file
+dump(c("FLAGS","run_NN"), file = "dumped.R")
+############## Here we correct an error that happens when dumping, so we will override line 2 in the newly created file #############
+#make sure that directory is set correctly
+#dir <- getwd()
+#setwd(dir)
+#open and override line 2
+x <- readLines("dumped.R")
+x[2] <- "flags(flag_numeric('dropout1', 0.3), flag_integer('neurons1', 64),"
+x[3] <- "    flag_integer('neurons2', 16), flag_numeric('l2', 0.001))"
+x[4] <- ""
+x[5] <- "" 
+x[6] <- "" 
+# then write output
+write(x, file = "dumped.R")
+
+#append a line to dumped.R that triggers the run_NN function
+line = "run_NN(FLAGS)"
+cat(line,file="dumped.R",append=TRUE)
+
+###########    Use the tfruns library to run a random selection of the possible hyperparameter combinations   ######################
+########### by calling the dumped.R file and then selecting the parameter combo which produced the best validation error  ##########
+########### Note that we specified flags in the dump file but that alternative flags can be passed to training_runs see the option (flags = par) below ##########
+
+#define a dictionary over potential hyperparamter combinations
+par <- list(
+  dropout1 = c(0.3,0.4),
+  neurons1 = c(64,128),
+  neurons2 = c(16,64),
+  l2 = c(0.001,0.01)
+)
+
+#run the NN in the file dumped.R for 0.25 % of hyperparameter combinations in par 
+runs <- tuning_run('dumped.R', runs_dir = '_tuning', sample = 0.25, flags = par, confirm = FALSE)
+
+#store the attributes of the best run
+best_run <- ls_runs(order = metric_val_mean_squared_error, decreasing= F, runs_dir = '_tuning')[1,]
+```
+
+
+```{r NN_run_best_model, echo=FALSE,  message=FALSE, include = FALSE}
+
+#run the NN with the parameters selected in best_model
+run <- training_run('dumped.R',flags = list(
+  dropout1 = best_run$flag_dropout1,
+  neurons1 = best_run$flag_neurons1,
+  neurons2 = best_run$flag_neurons2,
+  #neurons3 = best_run$flag_neurons3,
+  l2 = best_run$flag_l2#,
+  #lr = best_run$flag_lr
+  ))
+
+#save fitted best model
+best_model <- load_model_hdf5('model.h5')
+
+#calculate prediction from best model
+prediction <- predict(best_model, test_data %>% select(-date,-y) %>% as.matrix())
+y_hat_NN <- prediction
+MPE_NN <- mean ((prediction - test_data %>% pull(y) %>% as.matrix()) ^ 2)
+
+#Update values in collection df
+hyper_df[11, ] <-c("Epochs",NA,NA,10)
+hyper_df[12, ] <-c("Patience",NA,NA,5)
+hyper_df[13, ] <-c("Activation function",NA,NA, "relu")
+hyper_df[14, ] <-c("Loss function",NA,NA, "mse"  )
+hyper_df[15, ] <-c("Learning rate",NA,NA, 0.01  )
+
+hyper_df[16, ] <-c("L2 Regularization low",NA,NA,  par[4][[1]][1])
+hyper_df[17, ] <-c("L2 Regularization high",NA,NA,  par[4][[1]][2])
+hyper_df[18, ] <-c("L2 Regularization choice",NA,NA,  best_run$flag_l2)
+
+hyper_df[19, ] <-c("dropout1 low",NA,NA, par[1][[1]][1] )
+hyper_df[20, ] <-c("dropout1 high",NA,NA, par[1][[1]][2] )
+hyper_df[21, ] <-c("dropout1 choice",NA,NA, best_run$flag_dropout1 )
+
+hyper_df[22, ] <-c("neurons layer 1 low",NA,NA, par[2][[1]][1] )
+hyper_df[23, ] <-c("neurons layer 1 high",NA,NA, par[2][[1]][2] )
+hyper_df[24, ] <-c("neurons layer 1 choice",NA,NA, best_run$flag_neurons1 )
+
+hyper_df[25, ] <-c("neurons layer 2 low",NA,NA, par[3][[1]][1] )
+hyper_df[26, ] <-c("neurons layer 2 high",NA,NA, par[3][[1]][2] )
+hyper_df[27, ] <-c("neurons layer 2 choice",NA,NA, best_run$flag_neurons2 )
+
+MPE_df[3, ] <-c("Neural Network",round(MPE_NN,2))
+
+
+```
+
+```{r question5NN, echo=FALSE,  message=FALSE,warning = FALSE}
+#this code targets the first 2 bullet points of question 5. It creates portfolio sorts on y_hat of the current model (in this case the NN). A portfolio is then created that buys the 10th quantile and sells the 1 quantile. The resulting average return is collected in a dataframe. For each model that will follow, this process will be repeated and the resulting average return will be appended to the collection data frame.
+
+################################################################################
+#                         portfolio sort:
+################################################################################
+#remove previously defined unnecessary vars
+rm(quantiles,portfolios,portfolios_ts,portfolios_ts_101,portfolio_returns,average_ret)
+
+# Split your data by date: 2012-01-01
+initial_data2 <- split(data_portfolio_sort, data_portfolio_sort$date < as.Date("2012-01-01"))
+# Testing data: after 2012-01-01
+test_data_portfolio_sort <- initial_data2[[1]] %>% cbind(y_hat_NN) %>% dplyr::rename(y_hat_NN = "y_hat_NN")
+
+quantiles <- test_data_portfolio_sort %>%
+  na.omit() %>%
+  group_by(permno) %>%
+  arrange(permno, date) %>%
+  group_by(date) %>%
+  summarise_at(vars(y_hat_NN), lst(!!!percentiles_funs))
+
+quant_nn <- quantiles %>%
+   pivot_longer(-date, names_to = "Quantile") %>%
+   ggplot(aes(x = date, y = value, color = Quantile)) + geom_line() +
+   labs(x = "", y = "")+
+  theme_classic()+
+      theme(axis.title = element_text(size = 8),
+        axis.text = element_text(size = 7),
+        title = element_text(size = 7),
+        legend.title = element_text(size = 8),
+        legend.text = element_text(size = 7))+
+   ggtitle(latex2exp::TeX("Neural Network"))
+
+# sort all stocks into decile portfolios
+portfolios <- test_data_portfolio_sort %>%
+  left_join(quantiles, by = "date") %>%
+  mutate(portfolio = case_when(y_hat_NN <= q10 ~ 1L,
+                               y_hat_NN > q10 & y_hat_NN <= q20 ~ 2L,
+                               y_hat_NN > q20 & y_hat_NN <= q30 ~ 3L,
+                               y_hat_NN > q30 & y_hat_NN <= q40 ~ 4L,
+                               y_hat_NN > q40 & y_hat_NN <= q50 ~ 5L,
+                               y_hat_NN > q50 & y_hat_NN <= q60 ~ 6L,
+                               y_hat_NN > q60 & y_hat_NN <= q70 ~ 7L,
+                               y_hat_NN > q70 & y_hat_NN <= q80 ~ 8L,
+                               y_hat_NN > q80 & y_hat_NN <= q90 ~ 9L,
+                               y_hat_NN > q90 ~ 10L))
+
+#calculate the market cap weighted average retruns for each portfolio for each month
+portfolios_ts <- portfolios %>%
+  mutate(portfolio = as.character(portfolio)) %>%
+  group_by(portfolio, date) %>%
+  summarize(ret_vw = weighted.mean(y_hat_NN, mktcap, na.rm = TRUE))%>%
+  #ret_equal_weights = mean(y_hat_ridge, na.rm = TRUE)) %>%                  # mkt_excess = mkt -rf used for CAPM
+  na.omit() %>%
+  ungroup()
+
+#extract unique number of available portfolios 
+# sometimes, if y_hat has less than 10 unique predictions, it can't be split in 10 unique quantiles
+unique_number <- length(unique(portfolios_ts$portfolio))
+string_value <- str_glue('"{unique_number}"')
+
+# Create buy 10 sell 1 portfolio
+portfolios_ts_101 <- portfolios_ts %>%
+  filter(portfolio %in% c("1", string_value)) %>%
+  pivot_wider(names_from = portfolio,
+              values_from = ret_vw) %>%
+  mutate(ret_vw = `unique_number` - `1`,
+         portfolio = "10-1") %>%
+  select(portfolio, date, ret_vw)
+
+# combine everything
+portfolio_returns <- bind_rows(portfolios_ts_101) %>%
+  mutate(portfolio = factor(portfolio, levels = c(as.character(seq(1, unique_number, 1)), "10-1")))
+
+#calculate the average return for Forest buy 10 sell 1 portfolio
+average_ret <- portfolio_returns %>%
+  group_by(portfolio) %>%
+  arrange(date) %>%
+  do(model = lm(paste0("ret_vw ~ 1"), data = .)) %>%
+  mutate(nw_stderror = sqrt(diag(sandwich::NeweyWest(model, lag = 6)))) %>%
+  mutate(broom::tidy(model)) %>%
+  ungroup() %>%
+  mutate(nw_tstat = estimate / nw_stderror) %>%
+  select(estimate, nw_tstat) %>%
+  t() 
+
+average_ret <- data.frame(average_ret) %>% 
+  dplyr::rename("Neural Network"="average_ret")
+
+#collect the prediction for current model
+collect_portolio101 <- cbind(collect_portolio101,average_ret)
+```
+
+## 4.4) Model comparison and collection of hyperparameters:
+
+Table 1 compares each model performance for the out-of-sample Mean Squared Error. In our case, the Forest is the worst performing model while the Neural Network barely performs better than Ridge. This is surprising as one might think a more sophisticated model would predict better out of sample in comparison with a simple linear shrinkage regression. This is in line with the findings in Gu, Kelly and Xiu (2020). However these results might not be robust as they depend on which 4 combinations where run for the NN out of the possible 16.
+```{r print_MPE_tbl, echo=FALSE,  message=FALSE}
+
+#Print current MSPE comparison table
+options(kableExtra.latex.load_packages = FALSE)
+
+MPE_df %>% kbl(digits = 2, caption = "Mean Squared Error comparison", longtable = T) %>%
+  kable_classic_2(full_width = F) #%>% row_spec(3, bold = T, color = "white", background = "#99FF33")
+
+```
+
+Finally we report all the collected hyperparameters in a Table 2 (similar but not equal to table 5 in the Online Appendix of the Gu, Kelly and Xiu (2020)). Instead Table 2 automatically collects the relevant values for each model. For each parameter tuned we provide the chosen value and minimum and maximum values of the potential range. The parameter manually included by us do not include the minimum/maximum range. The range of most parameters was chosen to be relatively narrow to reduce computation time but it could be easily scaled up to larger grids. 
+```{r hypertable, echo=FALSE,  message=FALSE,warning = FALSE}
+options(knitr.kable.NA = '')
+#knitr::kable(hyper_df, caption = "Hyperparameter-Tuning Overview", digits = 2, booktabs = T)  
+
+hyper_df %>% kbl(digits = 2, caption = "Hyperparameter-Tuning Overview", booktabs = T) %>%
+  kable_classic_2(full_width = F) %>%
+  row_spec(3, bold = T, color = "white", background = "#660000")%>%
+  row_spec(7, bold = T, color = "white", background = "#003300")%>%
+  row_spec(10, bold = T, color = "white", background = "#003300")%>%
+  row_spec(18, bold = T, color = "white", background = "#000066")%>%
+  row_spec(21, bold = T, color = "white", background = "#000066")%>%
+  row_spec(24, bold = T, color = "white", background = "#000066")%>%
+  row_spec(27, bold = T, color = "white", background = "#000066")
+
+```
+
+\newpage
+## 5) Question 5: Portfolio sorts
+
+```{r Q5note, echo=FALSE,  message=FALSE, warning = FALSE, fig.width=6,fig.height=3, fig.align="center", fig.cap="Expected returns sorted by quantiles for each ML model"}
+# Note that after each model there was a separate code chunk called question5Ridge, question5Tree or question5Forest.
+# In these sections, we perform the portfolio sort and save the result to an object called collect_portolio101. 
+# Here in Q5 we only output the table so no computation is done.
+
+ 
+plot <- ggarrange(quant_ridge, quant_forest, quant_nn, ncol=3, nrow=1,common.legend = TRUE,legend = "bottom")
+annotate_figure(plot, left = text_grob(latex2exp::TeX("Adjusted returns"), rot = 90, size=9))
+
+```
+ We use the out-of-sample prediction $\widehat{r}_{i,t+1}$ to sort portfolios into 10 quantiles based on each model's prediction. Figure 5 shows that the random forest predicts the higher returns irrespective of the quantile. As seen before, this is the worst performing model out-of-sample as it seems to be overfitting data and thus overpredicts returns. The Neural network does a better job at discriminating between the best and worst stocks as it can catch non linear interactions better than the Ridge. This can be seen as the Neural Network indeed predicts negative returns for the worst performing quantile while the Ridge predicts strictly positive ones.
+
+In order to see how this predictions would affect wealth, we implement a strategy that buys the best performing stocks (quantile 1) and sells the worst performing ones (quantile 10) according to each model predictions. Table 3 provides the average returns of the zero-net investment strategy (q10-q1) for each model. The NW t-statistics are calculated by using standard errors following Newey & West (1987, 1994). The best performing model out of sample is the Neural Network, which does a better job at sorting stocks and provides the highest average expected return followed by the Ridge and lastly the Forest. 
+```{r AnswerQ5_last_table, echo=FALSE,  message=FALSE, warning=FALSE}
+options(knitr.kable.NA = '')
+options(kableExtra.latex.load_packages = FALSE)
+
+rownames(collect_portolio101) <-c("Average return","NW t-statistic")
+collect_portolio101 %>% kbl(digits = 2, caption = "Returns from applying strategy (buy q10 and sell q1)", longtable = T, booktabs=T) %>% kable_classic_2(full_width = F)
+
+```
+
+\newpage
+## 6) References:
+Gu, S., Kelly, B., & Xiu, D. (2018). Empirical asset pricing via machine learning (No. w25398). National bureau of economic research.
+Newey, W. K., & West, K. D. (1987). Hypothesis testing with efficient method of moments estimation. International Economic Review, 777-787.
+Newey, W. K., & West, K. D. (1994). Automatic lag selection in covariance matrix estimation. The Review of Economic Studies, 61(4), 631-653.
+Ross, S. A., (1976). The Arbitrage Theory of Capital Asset Pricing. Journal of Economic Theory 13.341– 60.
+Xiao, H., & Sun, Y. (2019). On tuning parameter selection in model selection and model averaging: A monte carlo study. Journal of Risk and Financial Management, 12(3), 109.
