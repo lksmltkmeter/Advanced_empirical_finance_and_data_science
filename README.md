@@ -1,6 +1,6 @@
 # Empirical-Finance-Replications
 
-This repo refers to code submitted for graded mandatory assignments in the course "Advanced Empirical Finance: Topics and Data Science" at the University of Copenhagen (see https://kurser.ku.dk/course/a%C3%98kk08407u/). All files are co-authored by Pablo Serrano Ascandoni & Lukas Malte Kemeter.
+This repo refers to code submitted for graded mandatory assignments in the course "Advanced Empirical Finance: Topics and Data Science" at the University of Copenhagen (see https://kurser.ku.dk/course/a%C3%98kk08407u/) by Stefan Voigt. All files are co-authored by Pablo Serrano Ascandoni & Lukas Malte Kemeter.
 
 Assignment 1 replicates the main findings in: Jobson, J. D., & Korkie, B. (1980). Estimation for Markowitz efficient portfolios. Journal of the American Statistical Association, 75(371), 544-554.
 
